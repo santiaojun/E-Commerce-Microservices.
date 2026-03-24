@@ -1,4 +1,3 @@
-# CS6650 Assignment 3 - Team Guide (Synced to Current Repo)
 
 This document reflects the **current codebase and runtime behavior** in this repository.
 
