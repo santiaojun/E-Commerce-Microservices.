@@ -1,0 +1,112 @@
+package com.cs6650.product.controller;
+
+import com.cs6650.product.dto.ErrorResponse;
+import com.cs6650.product.dto.Product;
+import com.cs6650.product.service.ProductService;
+import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.FieldError;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Random;
+
+@RestController
+public class ProductController {
+
+    private static final Logger logger = LoggerFactory.getLogger(ProductController.class);
+    private final ProductService productService;
+    private final Random random = new Random();
+
+    @Value("${product.service.error-rate:0.5}")
+    private double errorRate;
+
+    public ProductController(ProductService productService) {
+        this.productService = productService;
+    }
+
+    /**
+     * Create a new product
+     * 50% success (201), 50% service unavailable (503)
+     */
+    @PostMapping("/product")
+    public ResponseEntity<?> createProduct(@Valid @RequestBody Product product) {
+        logger.info("Received create product request: {}", product.getName());
+
+        // Simulate 50% failure rate with 503
+        boolean shouldFail = random.nextDouble() < errorRate;
+
+        if (shouldFail) {
+            logger.warn("Simulating service unavailable for product: {}", product.getName());
+            ErrorResponse errorResponse = new ErrorResponse(
+                    "SERVICE_UNAVAILABLE",
+                    "Service temporarily unavailable. Please try again later."
+            );
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(errorResponse);
+        }
+
+        // Create product normally
+        Product createdProduct = productService.createProduct(product);
+        logger.info("Product created successfully: ID={}", createdProduct.getProductId());
+        return ResponseEntity.status(HttpStatus.CREATED).body(createdProduct);
+    }
+
+    /**
+     * Get product by ID
+     * Normal functionality - always works
+     */
+    @GetMapping("/products/{productId}")
+    public ResponseEntity<?> getProduct(@PathVariable Long productId) {
+        logger.info("Received get product request: ID={}", productId);
+
+        return productService.getProductById(productId)
+                .<ResponseEntity<?>>map(product -> {
+                    logger.info("Product found: ID={}", productId);
+                    return ResponseEntity.ok(product);
+                })
+                .orElseGet(() -> {
+                    logger.warn("Product not found: ID={}", productId);
+                    ErrorResponse errorResponse = new ErrorResponse(
+                            "NOT_FOUND",
+                            "Product with ID " + productId + " not found"
+                    );
+                    return ResponseEntity.status(HttpStatus.NOT_FOUND).body(errorResponse);
+                });
+    }
+
+    /**
+     * Health check endpoint
+     * Always returns 200 OK (so ALB thinks the instance is healthy)
+     */
+    @GetMapping("/health")
+    public ResponseEntity<Map<String, Object>> healthCheck() {
+        Map<String, Object> health = new HashMap<>();
+        health.put("status", "UP");
+        health.put("service", "bad-product-service");
+        health.put("totalProducts", productService.getTotalProducts());
+        health.put("errorRate", errorRate);
+
+        logger.debug("Health check passed");
+        return ResponseEntity.ok(health);
+    }
+
+    /**
+     * Handle validation errors
+     */
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ErrorResponse handleValidationException(MethodArgumentNotValidException ex) {
+        FieldError fieldError = ex.getBindingResult().getFieldError();
+        String errorMessage = fieldError != null ? fieldError.getDefaultMessage()
+                : "Invalid request format";
+
+        logger.error("Validation error: {}", errorMessage);
+        return new ErrorResponse("INVALID_REQUEST", errorMessage);
+    }
+}

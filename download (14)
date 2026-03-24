@@ -1,0 +1,278 @@
+# CS6650 Assignment 3 - Team Development Guide
+
+## Team & Module Assignment
+
+| Name | Module | What to Build |
+|------|--------|---------------|
+| Yunhong Huang | Module 1 | ShoppingCart Service + RabbitMQ Publisher |
+| Qingyu Cheng | Module 2 | Warehouse Consumer + RabbitMQ Broker Configuration |
+| Runxin Shao | Module 3 | Credit Card Authorizer + Bad Product Service + Load Test Client |
+| Ziqi Yang | Module 4 | Dockerfiles, docker-compose, Terraform, AWS Deployment, Report |
+
+---
+
+## Dependency Map
+
+```
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │                        DEPENDENCY OVERVIEW                           │
+ │                                                                      │
+ │  Module 3: CCA ───────┐                                              │
+ │  (Runxin)             │                                              │
+ │  ⚠️ DELIVER FIRST     ├──▶ Module 1: ShoppingCart Service            │
+ │                       │    (Yunhong)                                 │
+ │  Module 2: RMQ ───────┘    checkout() needs BOTH CCA + RabbitMQ      │
+ │  (Qingyu)                                                            │
+ │                                                                      │
+ │  Module 1 + 2 + 3 ──────▶ Module 4: Docker / AWS Deployment          │
+ │  (all services done)       (Ziqi)                                    │
+ │                                                                      │
+ │  Module 4 deployed ──────▶ Module 3: Load Test                       │
+ │  (AWS ready)               (Runxin)                                  │
+ └──────────────────────────────────────────────────────────────────────┘
+```
+
+### Who Blocks Whom?
+
+| If this is late... | ...these people are blocked |
+|--------------------|-----------------------------|
+| **CCA (Runxin)** | Yunhong cannot test `checkout()` — **HIGHEST PRIORITY** |
+| **RabbitMQ broker (Qingyu)** | Yunhong cannot test publishing; Qingyu's own consumer can't test either |
+| **ShoppingCart Service (Yunhong)** | Load testing cannot begin |
+| **All services** | Ziqi cannot do integration or AWS deployment |
+
+### What CAN be done in parallel (no blocking)?
+
+| Person | Can do immediately without waiting |
+|--------|------------------------------------|
+| Runxin | CCA is fully independent — start Day 1 |
+| Runxin | Bad Product Service is independent — copy A2 Product, add 50% 503 logic |
+| Qingyu | `docker run rabbitmq` locally + Warehouse Consumer — independent |
+| Yunhong | `POST /shopping-cart` and `POST /addItem` — no external dependency |
+| Yunhong | `checkout()` HTTP-call-to-CCA logic — can mock CCA locally first, swap real CCA later |
+| Ziqi | Dockerfiles + docker-compose skeleton — can write templates before services are done |
+
+---
+
+## Module Details
+
+### Module 1: ShoppingCart Service (Yunhong Huang)
+
+**Spring Boot project in `shopping-cart-service/`**
+
+**Endpoints:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/shopping-cart` | Create cart, accept `customer_id`, return `shopping_cart_id` |
+| POST | `/shopping-carts/{id}/addItem` | Add item, accept `product_id` + `quantity` |
+| POST | `/shopping-carts/{id}/checkout` | Checkout, accept `credit_card_number` |
+
+**Checkout internal flow:**
+1. Receive `credit_card_number` from request body
+2. HTTP call to CCA: `POST http://<CCA_HOST>:8082/credit-card-authorizer/authorize`
+3. If CCA returns 200 → publish order message to RabbitMQ with **Publisher Confirms**
+4. If CCA returns 402 → return error to client, do NOT publish
+5. If CCA returns 400 → return error to client, do NOT publish
+
+**RabbitMQ Publisher requirements:**
+- Must use **Publisher Confirms** (`channel.confirmSelect()` + `channel.waitForConfirms()`)
+- Use channel pool (Apache Commons Pool) for performance — don't open/close channel per request
+- Queue name: `warehouse_queue` (agree with Qingyu)
+- Message format (JSON):
+```json
+{
+  "order_id": 123,
+  "items": [
+    {"product_id": 1, "quantity": 2},
+    {"product_id": 5, "quantity": 1}
+  ]
+}
+```
+
+**Config (application.properties):**
+```properties
+server.port=8081
+cca.service.url=http://localhost:8082
+rabbitmq.host=localhost
+rabbitmq.port=5672
+rabbitmq.queue=warehouse_queue
+```
+
+**Dependencies needed in pom.xml:**
+- `spring-boot-starter-web`
+- `amqp-client` (com.rabbitmq)
+- `commons-pool2` (org.apache.commons) — for channel pooling
+
+---
+
+### Module 2: Warehouse Consumer + RabbitMQ Broker (Qingyu Cheng)
+
+**Java program (NOT a Spring Boot web app) in `warehouse-consumer/`**
+
+**RabbitMQ Broker (local development):**
+```bash
+docker run -d --name rabbitmq \
+  -p 5672:5672 \
+  -p 15672:15672 \
+  rabbitmq:3-management
+```
+Management console: http://localhost:15672 (guest/guest)
+
+**Warehouse Consumer requirements:**
+- Multi-threaded consumer, each thread gets its own `Channel`
+- `channel.basicQos(1)` — one message at a time per consumer
+- **Manual Acknowledgement**: `channel.basicAck(deliveryTag, false)` — NOT auto ack
+- Consumer thread count must be **configurable** (for tuning during load test)
+- Reference code: `docs/reference/RecvMT.java`
+
+**Data tracking (thread-safe):**
+```java
+// Total orders
+private static final AtomicInteger totalOrders = new AtomicInteger(0);
+// Quantity per product
+private static final ConcurrentHashMap<Integer, AtomicInteger> productQuantities = new ConcurrentHashMap<>();
+```
+
+**On shutdown — print total orders:**
+```java
+Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+    System.out.println("Total orders processed: " + totalOrders.get());
+}));
+```
+
+**Agreed contract with Module 1:**
+- Queue name: `warehouse_queue`
+- Queue declared as durable: `channel.queueDeclare("warehouse_queue", true, false, false, null)`
+- Message format: see Module 1 JSON above
+
+**Dependencies needed in pom.xml:**
+- `amqp-client` (com.rabbitmq)
+- `jackson-databind` (com.fasterxml.jackson.core) — for JSON parsing
+
+---
+
+### Module 3: CCA + Bad Product + Load Test (Runxin Shao)
+
+#### Credit Card Authorizer ⚠️ HIGHEST PRIORITY — deliver Day 1
+
+**Spring Boot project in `credit-card-authorizer/`**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/credit-card-authorizer/authorize` | Validate and authorize credit card |
+
+**Logic:**
+1. Extract `credit_card_number` from JSON body
+2. Validate format with regex: `^\d{4}-\d{4}-\d{4}-\d{4}$`
+    - Invalid → return **400** Bad Request
+3. Valid format → random:
+    - 90% → return **200** OK `{"status": "Authorized"}`
+    - 10% → return **402** Payment Required `{"error": "DECLINED", "message": "Payment declined"}`
+
+**Config:** `server.port=8082`
+
+**Test with curl:**
+```bash
+# Valid format (run multiple times to see 200 vs 402)
+curl -X POST http://localhost:8082/credit-card-authorizer/authorize \
+  -H "Content-Type: application/json" \
+  -d '{"credit_card_number": "1234-5678-9012-3456"}'
+
+# Invalid format → 400
+curl -X POST http://localhost:8082/credit-card-authorizer/authorize \
+  -H "Content-Type: application/json" \
+  -d '{"credit_card_number": "1234567890123456"}'
+```
+
+#### Bad Product Service (after CCA is done)
+
+**Spring Boot project in `bad-product-service/`**
+
+- Copy A2 Product Service
+- Modify `POST /product`: 50% return 201 (normal), 50% return 503 (error)
+- Add `GET /health` that **always returns 200** (so ALB doesn't mark it unhealthy)
+
+#### Load Test Client (after AWS deployment)
+
+**Manual load testing (external tool/script)**
+
+- `load-test-client/` in this repo is a placeholder only
+- Send 200,000 `POST /shopping-carts/{id}/checkout` requests to ALB
+- Thread count configurable via command line arg
+- Print: successful count, failed count, wall time, throughput (req/sec)
+
+---
+
+### Module 4: Infrastructure & Deployment (Ziqi Yang)
+
+**Dockerfiles:** One per service in each service directory
+
+**docker-compose.yml:** In project root, wires all services + RabbitMQ together
+
+**Terraform** (`infrastructure/terraform/`):
+- VPC, Security Groups
+- Application Load Balancer with Listener Rules:
+    - `/product*` → Product Target Group
+    - `/shopping-cart*` → ShoppingCart Target Group
+    - `/credit-card*` → CCA Target Group
+- ATW (Automatic Target Weights) enabled on all Target Groups
+- Product Target Group: 2 good instances + 1 bad instance
+- Health check: use `/health` endpoint or set unhealthy threshold high enough that bad instance stays in service
+- RabbitMQ container (standalone)
+- ECS task definitions for all services
+
+**Report (PDF in `docs/`):**
+- Team member names
+- Repo URL
+- ATW screenshot (bad instance gets less traffic)
+- RabbitMQ console screenshot (queue length over time)
+- Warehouse shutdown output screenshot (total orders)
+
+---
+
+## Agreed Contracts
+
+These are shared agreements everyone must follow:
+
+| Item | Value |
+|------|-------|
+| RabbitMQ queue name | `warehouse_queue` |
+| Queue durable | `true` |
+| Message format | JSON (see Module 1 section) |
+| CCA endpoint | `POST /credit-card-authorizer/authorize` |
+| CCA request body | `{"credit_card_number": "1234-5678-9012-3456"}` |
+| Product Service port | 8080 |
+| ShoppingCart Service port | 8081 |
+| CCA port | 8082 |
+| RabbitMQ AMQP port | 5672 |
+| RabbitMQ Management port | 15672 |
+
+---
+
+## Git Workflow
+
+```bash
+# Everyone works on their own branch
+git checkout -b feature/module-1-shopping-cart   # Yunhong
+git checkout -b feature/module-2-warehouse       # Qingyu
+git checkout -b feature/module-3-cca             # Runxin
+git checkout -b feature/module-4-infrastructure  # Ziqi
+
+# When done, push and create a Pull Request to main
+git push origin feature/module-1-shopping-cart
+
+# After review, merge to main
+```
+
+---
+
+## Timeline
+
+| Phase | Days | Tasks |
+|-------|------|-------|
+| **Phase 1** | Day 1-3 | Everyone builds their services independently. Runxin delivers CCA first. |
+| **Phase 2** | Day 4-5 | Local integration via docker-compose. End-to-end test: create cart → add item → checkout → warehouse receives message. |
+| **Phase 3** | Day 6-7 | Ziqi deploys to AWS. Configure ALB, Target Groups, ATW. |
+| **Phase 4** | Day 8-9 | Runxin runs 200K load test. Team tunes consumer threads and RabbitMQ config. Target: flat queue < 1000. |
+| **Phase 5** | Day 10 | Screenshots, write report, submit on Canvas. |

@@ -1,0 +1,89 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+
+  credit-card-authorizer:
+    build:
+      context: ./credit-card-authorizer
+      dockerfile: Dockerfile
+    container_name: credit-card-authorizer
+    ports:
+      - "8082:8082"
+
+  shopping-cart-service:
+    build:
+      context: ./shopping-cart-service
+      dockerfile: Dockerfile
+    container_name: shopping-cart-service
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      SERVER_PORT: 8081
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      RABBITMQ_QUEUE: warehouse_queue
+    ports:
+      - "8081:8081"
+
+  product-good-a:
+    image: cs6650/product-service:local
+    build:
+      context: ./bad-product-service
+      dockerfile: Dockerfile
+    container_name: product-good-a
+    environment:
+      SERVER_PORT: 8080
+      PRODUCT_SERVICE_ERROR_RATE: 0.0
+    ports:
+      - "8080:8080"
+
+  product-good-b:
+    image: cs6650/product-service:local
+    container_name: product-good-b
+    environment:
+      SERVER_PORT: 8080
+      PRODUCT_SERVICE_ERROR_RATE: 0.0
+
+  bad-product-service:
+    image: cs6650/product-service:local
+    container_name: bad-product-service
+    environment:
+      SERVER_PORT: 8080
+      PRODUCT_SERVICE_ERROR_RATE: 0.5
+
+  warehouse-consumer:
+    build:
+      context: ./warehouse-consumer
+      dockerfile: Dockerfile
+    container_name: warehouse-consumer
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      RABBITMQ_VHOST: /
+      QUEUE_NAME: warehouse_queue
+      NUM_CONSUMER_THREADS: 10
+
+volumes:
+  rabbitmq-data:

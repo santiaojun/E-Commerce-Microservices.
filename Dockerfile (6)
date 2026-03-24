@@ -1,0 +1,20 @@
+package com.cs6650.product;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class BadProductServiceApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(BadProductServiceApplication.class, args);
+        System.out.println("====================================");
+        System.out.println("Bad Product Service Started");
+        System.out.println("Running on port: 8080");
+        System.out.println("Endpoints:");
+        System.out.println("  POST /product (50% success, 50% 503 error)");
+        System.out.println("  GET /products/{productId}");
+        System.out.println("  GET /health (always returns 200)");
+        System.out.println("====================================");
+    }
+}

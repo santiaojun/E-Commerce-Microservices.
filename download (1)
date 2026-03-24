@@ -1,0 +1,179 @@
+# CS6650 Assignment 3 - E-Commerce Microservices System
+
+## Team Members
+
+| Name | Module | Responsibilities |
+|------|--------|-----------------|
+| Yunhong Huang | Module 1 | ShoppingCart Service + RabbitMQ Publisher |
+| Qingyu Cheng | Module 2 | Warehouse Consumer + RabbitMQ Broker Configuration |
+| Runxin Shao | Module 3 | Credit Card Authorizer + Bad Product Service + Load Test Client |
+| Ziqi Yang | Module 4 | Terraform Infrastructure, ECS Deployment, Docker Orchestration, Report |
+
+## Documentation
+
+- [Team Guide](docs/TEAM_GUIDE.md)
+- [Project Summary](PROJECT_SUMMARY.md)
+
+## Architecture Overview
+
+```
+                         ┌─────────────────┐
+                         │   Load Balancer  │
+                         │   (AWS ALB)      │
+                         └────────┬─────────┘
+                  path-based routing
+              ┌───────────┼───────────┐
+              ▼           ▼           ▼
+     ┌──────────────┐ ┌────────┐ ┌──────────────┐
+     │ ShoppingCart  │ │Product │ │ Credit Card  │
+     │  Service     │ │Service │ │ Authorizer   │
+     └──────┬───────┘ └────────┘ └──────────────┘
+            │                          ▲
+            │  HTTP call (authorize)   │
+            ├──────────────────────────┘
+            │
+            │  publish (Publisher Confirms)
+            ▼
+     ┌──────────────┐
+     │  RabbitMQ    │
+     │  Broker      │
+     └──────┬───────┘
+            │  consume (Manual Ack)
+            ▼
+     ┌──────────────┐
+     │  Warehouse   │
+     │  Consumer    │
+     └──────────────┘
+```
+
+## Checkout Flow
+
+1. Client sends `POST /shopping-carts/{id}/checkout` with credit card number
+2. ShoppingCart Service calls Credit Card Authorizer (`POST /credit-card-authorizer/authorize`)
+3. If authorized (200), ShoppingCart publishes order message to RabbitMQ with Publisher Confirms
+4. If declined (402), returns error to client
+5. Warehouse Consumer picks up the message, updates order stats, sends Manual Ack
+
+## Project Structure
+
+```
+cs6650-a3/
+├── shopping-cart-service/       # ShoppingCart Service (Module 1)
+├── credit-card-authorizer/      # Credit Card Authorizer (Module 3)
+├── warehouse-consumer/          # Warehouse RabbitMQ Consumer (Module 2)
+├── bad-product-service/         # Product Service returning 50% 503s (Module 3)
+├── load-test-client/            # Placeholder only; load testing is run manually outside repo
+├── infrastructure/
+│   └── terraform/               # ALB, Target Groups, ECS, RabbitMQ (Module 4)
+├── docker-compose.yml           # Local development orchestration (Module 4)
+├── docs/                        # Report and screenshots
+└── README.md
+```
+
+## Tech Stack
+
+- **Language:** Java 17
+- **Framework:** Spring Boot 3.2.x
+- **Build Tool:** Maven
+- **Message Broker:** RabbitMQ (with Management Plugin)
+- **Load Balancer:** AWS Application Load Balancer (path-based routing + ATW)
+- **Infrastructure:** Terraform, Docker, AWS ECS
+- **Containerization:** Docker + docker-compose (local), ECS (production)
+
+## Services & Ports (Local Development)
+
+| Service | Port | Path Prefix |
+|---------|------|-------------|
+| Product Service | 8080 | `/product`, `/products` |
+| ShoppingCart Service | 8081 | `/shopping-cart`, `/shopping-carts` |
+| Credit Card Authorizer | 8082 | `/credit-card-authorizer` |
+| RabbitMQ | 5672 (AMQP), 15672 (Management UI) | — |
+| Warehouse Consumer | — (no HTTP, consumes from RabbitMQ) | — |
+
+## API Endpoints
+
+### Product Service
+- `POST /product` — Create a product
+- `GET /products/{productId}` — Get product by ID
+
+### ShoppingCart Service
+- `POST /shopping-carts?customer_id=<id>` — Create a new shopping cart
+- `POST /shopping-carts/{id}/addItem` — Add item to cart
+- `POST /shopping-carts/{id}/checkout` — Checkout (triggers CCA + RabbitMQ)
+
+### Credit Card Authorizer
+- `POST /credit-card-authorizer/authorize` — Validate & authorize credit card
+
+## RabbitMQ Message Format
+
+ShoppingCart → Warehouse message (JSON):
+```json
+{
+  "order_id": "5234224c-7d51-4b8e-b357-a445d9598d3a",
+  "items": [
+    { "product_id": 1, "quantity": 2 },
+    { "product_id": 5, "quantity": 1 }
+  ]
+}
+```
+
+## Getting Started
+
+### Prerequisites
+- Java 17+
+- Maven 3.8+
+- Docker & Docker Compose
+
+### Run Locally
+```bash
+# Start all services
+docker compose up --build
+
+# Or run individual services for development
+cd shopping-cart-service && mvn spring-boot:run
+cd credit-card-authorizer && mvn spring-boot:run
+```
+
+Local compose includes:
+- `product-good-a` and `product-good-b` (same code image, `PRODUCT_SERVICE_ERROR_RATE=0.0`)
+- `bad-product-service` (`PRODUCT_SERVICE_ERROR_RATE=0.5`)
+- `shopping-cart-service`, `credit-card-authorizer`, `warehouse-consumer`, `rabbitmq`
+
+### RabbitMQ Management Console
+After starting docker-compose, visit: http://localhost:15672
+- Username: `guest`
+- Password: `guest`
+
+## Load Testing
+
+This repository does not include a committed load-test client implementation.
+Load testing is run manually (external tool/script) against ALB endpoints.
+
+Target: 200,000 checkout requests with optimal throughput and near-zero RabbitMQ queue length.
+
+## Terraform (Module 4)
+
+```bash
+cd infrastructure/terraform
+cp terraform.tfvars.example terraform.tfvars
+# edit terraform.tfvars with your ECR image URIs
+terraform init
+terraform fmt -recursive
+terraform validate
+terraform plan -out plan.tfplan
+terraform apply plan.tfplan
+```
+
+After apply:
+- ALB DNS: `terraform output alb_dns_name`
+- RabbitMQ NLB DNS: `terraform output rabbitmq_nlb_dns_name`
+- RabbitMQ Management URL: `terraform output rabbitmq_management_url`
+
+## Submission Checklist
+
+- [ ] All services containerized and deployed on AWS
+- [ ] ALB with path-based routing and ATW enabled
+- [ ] ATW screenshot showing reduced traffic to bad instance
+- [ ] RabbitMQ console screenshot showing flat/near-zero queue length
+- [ ] Warehouse shutdown screenshot showing total order count
+- [ ] PDF report with all required content
